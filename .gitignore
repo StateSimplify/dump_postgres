@@ -1,0 +1,3 @@
+__pycache__/
+*.pyc
+postgres_server_schema_*/
