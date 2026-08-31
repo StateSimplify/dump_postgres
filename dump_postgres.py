@@ -200,7 +200,7 @@ def ask_executable(label, default=None, minimum_major=None):
         return executable, major, version_text
 
 
-def prompt_for_configuration():
+def prompt_for_connection():
     print()
     print("PostgreSQL server-wide schema export")
     print("------------------------------------")
@@ -257,11 +257,32 @@ def prompt_for_configuration():
         "",
     ) or None
 
+    return {
+        "host": host,
+        "port": port,
+        "discovery_database": discovery_database,
+        "username": username,
+        "password": password,
+        "sslmode": sslmode,
+        "sslrootcert": sslrootcert,
+        "sslcert": sslcert,
+        "sslkey": sslkey,
+        "connect_timeout": connect_timeout,
+        "lock_timeout": lock_timeout,
+        "role": role,
+    }
+
+
+def prompt_for_export_options(configuration, remote_major):
+    # pg_dump needs --filter (new in 17) and must not be older than
+    # the server; pg_dumpall only must not be older than the server.
+    pg_dump_minimum = max(17, remote_major)
+
     print()
     pg_dump_path, pg_dump_major, pg_dump_version = ask_executable(
         "Full path to pg_dump",
         default=shutil.which("pg_dump"),
-        minimum_major=17,
+        minimum_major=pg_dump_minimum,
     )
 
     export_globals = ask_yes_no(
@@ -291,6 +312,7 @@ def prompt_for_configuration():
         ) = ask_executable(
             "Full path to pg_dumpall",
             default=default_pg_dumpall,
+            minimum_major=remote_major,
         )
 
     include_templates = ask_yes_no(
@@ -320,19 +342,7 @@ def prompt_for_configuration():
         )
     ).resolve()
 
-    return {
-        "host": host,
-        "port": port,
-        "discovery_database": discovery_database,
-        "username": username,
-        "password": password,
-        "sslmode": sslmode,
-        "sslrootcert": sslrootcert,
-        "sslcert": sslcert,
-        "sslkey": sslkey,
-        "connect_timeout": connect_timeout,
-        "lock_timeout": lock_timeout,
-        "role": role,
+    configuration.update({
         "pg_dump_path": pg_dump_path,
         "pg_dump_major": pg_dump_major,
         "pg_dump_version": pg_dump_version,
@@ -344,7 +354,7 @@ def prompt_for_configuration():
         "include_create_database": include_create_database,
         "keep_ownership": keep_ownership,
         "output_directory": output_directory,
-    }
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -448,10 +458,45 @@ def connect_to_database(configuration, database, password_file):
         password_file,
     )
 
-    with without_pg_environment():
-        connection = psycopg.connect(conninfo)
+    try:
+        with without_pg_environment():
+            connection = psycopg.connect(conninfo)
+
+    except psycopg.OperationalError as error:
+        if "timeout" in str(error).lower():
+            raise psycopg.OperationalError(
+                f"connection to {configuration['host']} port "
+                f"{configuration['port']} (database "
+                f"\"{database}\", user "
+                f"\"{configuration['username']}\") timed out "
+                f"after {configuration['connect_timeout']} "
+                "seconds.\n"
+                "Nothing answered on that host and port, which "
+                "usually means the traffic is being dropped "
+                "before it reaches PostgreSQL. Check that the "
+                "host and port are correct, that PostgreSQL is "
+                "running and listening on that address, and that "
+                "a firewall, VPN, or cloud security group is not "
+                "blocking the connection."
+            ) from error
+
+        raise
 
     return connection, conninfo
+
+
+def validate_role(connection, role):
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("SET ROLE {}").format(sql.Identifier(role))
+            )
+    except psycopg.Error as error:
+        raise RuntimeError(
+            f'Cannot SET ROLE to "{role}": {error}'
+        ) from error
+
+    connection.rollback()
 
 
 # ---------------------------------------------------------------------------
@@ -1145,7 +1190,47 @@ def main():
     password_file = None
 
     try:
-        configuration = prompt_for_configuration()
+        configuration = prompt_for_connection()
+
+        password_file = create_temporary_password_file(
+            configuration["password"]
+        )
+
+        print()
+        print(
+            f"Connecting to {configuration['host']} port "
+            f"{configuration['port']} and discovering databases...",
+            flush=True,
+        )
+
+        discovery_connection, _ = connect_to_database(
+            configuration,
+            configuration["discovery_database"],
+            password_file,
+        )
+
+        try:
+            if configuration["role"]:
+                validate_role(
+                    discovery_connection,
+                    configuration["role"],
+                )
+
+            discovery = discover_databases(discovery_connection)
+            discovery_connection.rollback()
+        finally:
+            discovery_connection.close()
+
+        remote_major = server_major(
+            discovery["server_version_number"]
+        )
+
+        print(
+            f"Connected. Server version: {discovery['server_version']}",
+            flush=True,
+        )
+
+        prompt_for_export_options(configuration, remote_major)
         output_directory = configuration["output_directory"]
 
         if output_directory.exists() and any(output_directory.iterdir()):
@@ -1157,46 +1242,6 @@ def main():
                 return 0
 
         output_directory.mkdir(parents=True, exist_ok=True)
-
-        password_file = create_temporary_password_file(
-            configuration["password"]
-        )
-
-        print()
-        print("Discovering databases...", flush=True)
-
-        discovery_connection, _ = connect_to_database(
-            configuration,
-            configuration["discovery_database"],
-            password_file,
-        )
-
-        try:
-            discovery = discover_databases(discovery_connection)
-            discovery_connection.rollback()
-        finally:
-            discovery_connection.close()
-
-        remote_major = server_major(
-            discovery["server_version_number"]
-        )
-
-        if configuration["pg_dump_major"] < remote_major:
-            raise RuntimeError(
-                f"pg_dump major version "
-                f"{configuration['pg_dump_major']} is older than "
-                f"server major version {remote_major}."
-            )
-
-        if (
-            configuration["export_globals"]
-            and configuration["pg_dumpall_major"] < remote_major
-        ):
-            raise RuntimeError(
-                f"pg_dumpall major version "
-                f"{configuration['pg_dumpall_major']} is older than "
-                f"server major version {remote_major}."
-            )
 
         all_databases = discovery["databases"]
         eligible_databases = []

@@ -27,12 +27,14 @@ python dump_postgres.py
 ```
 
 The script prompts for the connection settings (host, port, user,
-password, SSL options, timeouts, optional `SET ROLE`), the paths to
-`pg_dump`/`pg_dumpall`, and the output directory. It then:
+password, SSL options, timeouts, optional `SET ROLE`) and immediately
+connects, so a wrong host or blocked port fails right away with a
+diagnostic instead of after every prompt. Knowing the server version, it
+then prompts for `pg_dump`/`pg_dumpall` paths (requiring a version new
+enough for that server) and the output directory, and:
 
-1. Connects to the discovery database and lists every database, skipping
-   templates (optional), databases that do not allow connections, and
-   databases the user cannot `CONNECT` to.
+1. Lists every database, skipping templates (optional), databases that
+   do not allow connections, and databases the user cannot `CONNECT` to.
 2. Optionally exports cluster-wide roles (without password hashes) and
    tablespaces via `pg_dumpall --globals-only`.
 3. For each remaining database: inspects permissions, writes a filter
