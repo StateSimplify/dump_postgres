@@ -73,3 +73,16 @@ Two prompts keep the export from hanging indefinitely:
   `--lock-wait-timeout`, so a table locked by another session makes that
   database fail with a clear error instead of blocking forever. Set
   either to `0` to wait forever.
+
+## Databases with very many tables
+
+`pg_dump` locks every table it dumps inside one transaction, and the
+server's lock table holds at most `max_locks_per_transaction ×
+(max_connections + max_prepared_transactions)` locks across all
+sessions. A database with more tables than that fails with
+`out of shared memory ... increase max_locks_per_transaction`. This is
+a server limit that no client-side option can work around: the script
+warns before attempting such a dump, and on this failure prints (and
+records in `report.json`) the exact `max_locks_per_transaction` value
+to ask the administrator for. Changing it requires a server restart;
+other databases in the run are still exported normally.

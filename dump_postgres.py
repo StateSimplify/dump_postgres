@@ -3,6 +3,7 @@
 import getpass
 import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -673,13 +674,19 @@ def inspect_database_permissions(connection, role):
             server_version,
             session_user,
             effective_user,
+            max_locks_per_transaction,
+            max_connections,
+            max_prepared_transactions,
         ) = cursor.execute(
             """
             SELECT
                 current_setting('server_version_num')::integer,
                 current_setting('server_version'),
                 session_user::text,
-                current_user::text
+                current_user::text,
+                current_setting('max_locks_per_transaction')::integer,
+                current_setting('max_connections')::integer,
+                current_setting('max_prepared_transactions')::integer
             """
         ).fetchone()
 
@@ -859,6 +866,29 @@ def inspect_database_permissions(connection, role):
         else:
             excluded_tables.add(relation_oid)
 
+    # Count the tables the dump will actually contain (and lock):
+    # everything except excluded tables, the descendants of excluded
+    # trees, and tables in excluded schemas or extensions.
+    excluded_oids = set(excluded_tables)
+    pending = list(excluded_table_trees)
+
+    while pending:
+        oid = pending.pop()
+
+        if oid in excluded_oids:
+            continue
+
+        excluded_oids.add(oid)
+        pending.extend(children.get(oid, ()))
+
+    included_table_count = sum(
+        1
+        for oid, relation in relations.items()
+        if oid not in excluded_oids
+        and relation["schema"] not in excluded_schemas
+        and relation["extension"] not in excluded_extensions
+    )
+
     return {
         "server_version_number": server_version_number,
         "server_version": server_version,
@@ -866,6 +896,10 @@ def inspect_database_permissions(connection, role):
         "effective_user": effective_user,
         "schema_count": len(schema_rows),
         "relation_count": len(relation_rows),
+        "included_table_count": included_table_count,
+        "max_locks_per_transaction": max_locks_per_transaction,
+        "max_connections": max_connections,
+        "max_prepared_transactions": max_prepared_transactions,
         "relations": relations,
         "excluded_schemas": excluded_schemas,
         "excluded_extensions": excluded_extensions,
@@ -1110,6 +1144,49 @@ def export_globals(configuration, password_file, output_directory):
 # Individual database export
 # ---------------------------------------------------------------------------
 
+def lock_capacity(inspection):
+    return (
+        inspection["max_locks_per_transaction"]
+        * (
+            inspection["max_connections"]
+            + inspection["max_prepared_transactions"]
+        )
+    )
+
+
+def lock_exhaustion_advice(inspection):
+    included = inspection["included_table_count"]
+    sessions = (
+        inspection["max_connections"]
+        + inspection["max_prepared_transactions"]
+    )
+
+    # 25% headroom over the exact requirement, since the lock table is
+    # shared with every other running session.
+    suggested = max(
+        128,
+        math.ceil(included * 1.25 / sessions),
+    )
+
+    return (
+        f"This database has about {included} dumpable tables, while "
+        "the server is only guaranteed to hold "
+        f"{lock_capacity(inspection)} table locks across all "
+        "sessions (max_locks_per_transaction="
+        f"{inspection['max_locks_per_transaction']} x "
+        f"(max_connections={inspection['max_connections']} + "
+        "max_prepared_transactions="
+        f"{inspection['max_prepared_transactions']})), and pg_dump "
+        "must lock every table it dumps inside a single "
+        'transaction. If the dump fails with "out of shared '
+        'memory", no client-side option can work around it: ask the '
+        "server administrator to raise max_locks_per_transaction to "
+        f"at least {suggested} (for example: ALTER SYSTEM SET "
+        f"max_locks_per_transaction = {suggested};), restart "
+        "PostgreSQL, and run this export again."
+    )
+
+
 def database_file_stem(database):
     return (
         f"{safe_filename(database['name'])}"
@@ -1124,6 +1201,7 @@ def inspection_report(inspection):
         "effective_user": inspection["effective_user"],
         "discovered_schema_count": inspection["schema_count"],
         "discovered_table_count": inspection["relation_count"],
+        "dumpable_table_count": inspection["included_table_count"],
         "excluded_schemas": sorted(
             inspection["excluded_schemas"]
         ),
@@ -1261,6 +1339,16 @@ def export_database(
             "--no-privileges",
         ])
 
+    if inspection["included_table_count"] > lock_capacity(inspection):
+        print()
+        print(
+            "Warning: this dump may exhaust the server's lock "
+            "table. " + lock_exhaustion_advice(inspection),
+            flush=True,
+        )
+        print("Attempting the dump anyway...", flush=True)
+        print()
+
     result = run_tool_to_file(
         configuration["pg_dump_path"],
         arguments,
@@ -1268,6 +1356,22 @@ def export_database(
     )
 
     status = "completed" if result["succeeded"] else "dump_failed"
+
+    messages = result["messages"] or ""
+
+    lock_exhaustion = (
+        not result["succeeded"]
+        and "out of shared memory" in messages
+        and "max_locks_per_transaction" in messages
+    )
+
+    failure_hint = None
+
+    if lock_exhaustion:
+        failure_hint = lock_exhaustion_advice(inspection)
+        print()
+        print(failure_hint, flush=True)
+        print()
 
     print(f"Database status: {status}")
 
@@ -1278,6 +1382,7 @@ def export_database(
         "filter_file": str(filter_path),
         "pg_dump_return_code": result["return_code"],
         "pg_dump_messages": result["messages"],
+        "failure_hint": failure_hint,
         "inspection": inspection_report(inspection),
     }
 
