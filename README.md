@@ -80,9 +80,27 @@ Two prompts keep the export from hanging indefinitely:
 server's lock table holds at most `max_locks_per_transaction ×
 (max_connections + max_prepared_transactions)` locks across all
 sessions. A database with more tables than that fails with
-`out of shared memory ... increase max_locks_per_transaction`. This is
-a server limit that no client-side option can work around: the script
-warns before attempting such a dump, and on this failure prints (and
-records in `report.json`) the exact `max_locks_per_transaction` value
-to ask the administrator for. Changing it requires a server restart;
-other databases in the run are still exported normally.
+`out of shared memory ... increase max_locks_per_transaction`. The
+script warns before attempting such a dump, and on this failure it
+prints (and records in `report.json`) the exact
+`max_locks_per_transaction` value to ask the administrator for
+(changing it requires a server restart) — and then **automatically
+falls back to a chunked export** that works within the existing limit:
+
+- `<db>__part-000-prelude.sql` — everything that needs no table
+  locks: the database, schemas, extensions, types, functions, and so
+  on, with every relation excluded.
+- `<db>__part-001.sql`, `part-002.sql`, … — groups of whole schemas,
+  each group small enough for the server's lock table. Groups are
+  ordered by cross-schema dependencies (foreign keys, views,
+  partitions, owned sequences), and schemas in a dependency cycle
+  stay in the same file, so the parts restore cleanly **in file name
+  order** (`psql -f` each part in sequence; parts after the prelude
+  must be run against the created database).
+
+A single schema (or dependency cycle) with more tables than the lock
+budget cannot be split further; such a chunk is attempted anyway with
+a warning, since servers usually hold somewhat more locks than the
+guaranteed minimum. Each chunk is a separate `pg_dump` snapshot, so
+avoid running DDL on the server during a chunked export. Databases
+whose dump fits in a single file are unaffected.

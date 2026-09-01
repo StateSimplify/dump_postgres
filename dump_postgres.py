@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import getpass
+import graphlib
 import ipaddress
 import json
 import math
@@ -779,6 +780,32 @@ def inspect_database_permissions(connection, role):
             """
         ).fetchall()
 
+        sequence_rows = cursor.execute(
+            """
+            SELECT
+                seq.oid::bigint,
+                n.nspname,
+                seq.relname,
+                dep.refobjid::bigint
+            FROM pg_catalog.pg_class AS seq
+
+            JOIN pg_catalog.pg_namespace AS n
+              ON n.oid = seq.relnamespace
+
+            JOIN pg_catalog.pg_depend AS dep
+              ON dep.classid =
+                    'pg_catalog.pg_class'::pg_catalog.regclass
+             AND dep.objid = seq.oid
+             AND dep.refclassid =
+                    'pg_catalog.pg_class'::pg_catalog.regclass
+             AND dep.deptype IN ('a', 'i')
+
+            WHERE seq.relkind = 'S'
+              AND n.nspname <> 'information_schema'
+              AND n.nspname !~ '^pg_'
+            """
+        ).fetchall()
+
     excluded_schema_oids = {
         oid
         for oid, name, allowed in schema_rows
@@ -866,9 +893,9 @@ def inspect_database_permissions(connection, role):
         else:
             excluded_tables.add(relation_oid)
 
-    # Count the tables the dump will actually contain (and lock):
-    # everything except excluded tables, the descendants of excluded
-    # trees, and tables in excluded schemas or extensions.
+    # Everything the dump will exclude: excluded tables, the
+    # descendants of excluded trees, and tables in excluded schemas
+    # or extensions.
     excluded_oids = set(excluded_tables)
     pending = list(excluded_table_trees)
 
@@ -881,13 +908,24 @@ def inspect_database_permissions(connection, role):
         excluded_oids.add(oid)
         pending.extend(children.get(oid, ()))
 
-    included_table_count = sum(
-        1
-        for oid, relation in relations.items()
-        if oid not in excluded_oids
-        and relation["schema"] not in excluded_schemas
-        and relation["extension"] not in excluded_extensions
+    for oid, relation in relations.items():
+        if (
+            relation["schema"] in excluded_schemas
+            or relation["extension"] in excluded_extensions
+        ):
+            excluded_oids.add(oid)
+
+    # Sequences owned by excluded tables cannot be restored (their
+    # OWNED BY clause references a missing table), so exclude them
+    # alongside their table.
+    excluded_sequences = sorted(
+        (schema_name, sequence_name, sequence_oid)
+        for sequence_oid, schema_name, sequence_name, owner_oid
+        in sequence_rows
+        if owner_oid in excluded_oids
     )
+
+    included_table_count = len(relations) - len(excluded_oids)
 
     return {
         "server_version_number": server_version_number,
@@ -905,6 +943,8 @@ def inspect_database_permissions(connection, role):
         "excluded_extensions": excluded_extensions,
         "excluded_tables": excluded_tables,
         "excluded_table_trees": excluded_table_trees,
+        "excluded_relation_oids": excluded_oids,
+        "excluded_sequences": excluded_sequences,
         "inaccessible_relations": inaccessible_relations,
     }
 
@@ -938,7 +978,7 @@ def relation_sort_key(oid, relations):
     return relation["schema"], relation["name"]
 
 
-def create_filter_file(path, inspection):
+def exclusion_filter_entries(inspection):
     entries = []
     relations = inspection["relations"]
 
@@ -980,15 +1020,33 @@ def create_filter_file(path, inspection):
             )
         )
 
+    for schema_name, sequence_name, _ in inspection[
+        "excluded_sequences"
+    ]:
+        entries.append(
+            "exclude table "
+            + qualified_filter_pattern(schema_name, sequence_name)
+        )
+
+    return entries
+
+
+def write_filter_file(path, entries):
     contents = [
-        "# Automatically generated pg_dump exclusions",
+        "# Automatically generated pg_dump filter",
         f"# Generated at {utc_now()}",
         "",
         *entries,
         "",
     ]
 
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(contents), encoding="utf-8")
+
+
+def create_filter_file(path, inspection):
+    entries = exclusion_filter_entries(inspection)
+    write_filter_file(path, entries)
     return entries
 
 
@@ -1187,6 +1245,370 @@ def lock_exhaustion_advice(inspection):
     )
 
 
+# ---------------------------------------------------------------------------
+# Chunked export for databases with more tables than the lock table
+# ---------------------------------------------------------------------------
+
+def collect_chunk_metadata(connection, role):
+    with connection.cursor() as cursor:
+        if role:
+            cursor.execute(
+                sql.SQL("SET ROLE {}").format(sql.Identifier(role))
+            )
+
+        relation_rows = cursor.execute(
+            """
+            SELECT
+                n.nspname,
+                c.oid::bigint,
+                c.relkind::text
+            FROM pg_catalog.pg_class AS c
+            JOIN pg_catalog.pg_namespace AS n
+              ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+              AND c.relpersistence <> 't'
+              AND n.nspname <> 'information_schema'
+              AND n.nspname !~ '^pg_'
+            """
+        ).fetchall()
+
+        edge_rows = cursor.execute(
+            """
+            -- foreign keys into another schema
+            SELECT DISTINCT nd.nspname, nr.nspname
+            FROM pg_catalog.pg_constraint AS con
+            JOIN pg_catalog.pg_class AS cd ON cd.oid = con.conrelid
+            JOIN pg_catalog.pg_namespace AS nd
+              ON nd.oid = cd.relnamespace
+            JOIN pg_catalog.pg_class AS cr ON cr.oid = con.confrelid
+            JOIN pg_catalog.pg_namespace AS nr
+              ON nr.oid = cr.relnamespace
+            WHERE con.contype = 'f'
+              AND nd.oid <> nr.oid
+
+            UNION
+
+            -- inheritance children and partitions of another schema
+            SELECT DISTINCT nd.nspname, nr.nspname
+            FROM pg_catalog.pg_inherits AS i
+            JOIN pg_catalog.pg_class AS cd ON cd.oid = i.inhrelid
+            JOIN pg_catalog.pg_namespace AS nd
+              ON nd.oid = cd.relnamespace
+            JOIN pg_catalog.pg_class AS cr ON cr.oid = i.inhparent
+            JOIN pg_catalog.pg_namespace AS nr
+              ON nr.oid = cr.relnamespace
+            WHERE nd.oid <> nr.oid
+
+            UNION
+
+            -- views over another schema's relations
+            SELECT DISTINCT nd.nspname, nr.nspname
+            FROM pg_catalog.pg_depend AS d
+            JOIN pg_catalog.pg_rewrite AS rw ON rw.oid = d.objid
+            JOIN pg_catalog.pg_class AS cd ON cd.oid = rw.ev_class
+            JOIN pg_catalog.pg_namespace AS nd
+              ON nd.oid = cd.relnamespace
+            JOIN pg_catalog.pg_class AS cr ON cr.oid = d.refobjid
+            JOIN pg_catalog.pg_namespace AS nr
+              ON nr.oid = cr.relnamespace
+            WHERE d.classid =
+                    'pg_catalog.pg_rewrite'::pg_catalog.regclass
+              AND d.refclassid =
+                    'pg_catalog.pg_class'::pg_catalog.regclass
+              AND nd.oid <> nr.oid
+
+            UNION
+
+            -- sequences owned by another schema's table
+            SELECT DISTINCT ns.nspname, nt.nspname
+            FROM pg_catalog.pg_depend AS d
+            JOIN pg_catalog.pg_class AS s
+              ON s.oid = d.objid AND s.relkind = 'S'
+            JOIN pg_catalog.pg_namespace AS ns
+              ON ns.oid = s.relnamespace
+            JOIN pg_catalog.pg_class AS t ON t.oid = d.refobjid
+            JOIN pg_catalog.pg_namespace AS nt
+              ON nt.oid = t.relnamespace
+            WHERE d.classid =
+                    'pg_catalog.pg_class'::pg_catalog.regclass
+              AND d.refclassid =
+                    'pg_catalog.pg_class'::pg_catalog.regclass
+              AND d.deptype IN ('a', 'i')
+              AND ns.oid <> nt.oid
+
+            UNION
+
+            -- column defaults using another schema's relations
+            SELECT DISTINCT nd.nspname, nr.nspname
+            FROM pg_catalog.pg_depend AS d
+            JOIN pg_catalog.pg_attrdef AS ad ON ad.oid = d.objid
+            JOIN pg_catalog.pg_class AS cd ON cd.oid = ad.adrelid
+            JOIN pg_catalog.pg_namespace AS nd
+              ON nd.oid = cd.relnamespace
+            JOIN pg_catalog.pg_class AS cr ON cr.oid = d.refobjid
+            JOIN pg_catalog.pg_namespace AS nr
+              ON nr.oid = cr.relnamespace
+            WHERE d.classid =
+                    'pg_catalog.pg_attrdef'::pg_catalog.regclass
+              AND d.refclassid =
+                    'pg_catalog.pg_class'::pg_catalog.regclass
+              AND nd.oid <> nr.oid
+            """
+        ).fetchall()
+
+    return relation_rows, edge_rows
+
+
+def order_schema_units(schema_names, edges):
+    """Return schemas grouped into units, ordered so that a unit only
+    depends on earlier units. Schemas in a dependency cycle share a
+    unit."""
+
+    owner = {name: name for name in schema_names}
+    members = {name: [name] for name in schema_names}
+
+    while True:
+        graph = {unit: set() for unit in members}
+
+        for dependent, required in edges:
+            dependent_unit = owner.get(dependent)
+            required_unit = owner.get(required)
+
+            if (
+                dependent_unit is None
+                or required_unit is None
+                or dependent_unit == required_unit
+            ):
+                continue
+
+            graph[dependent_unit].add(required_unit)
+
+        try:
+            ordered = list(
+                graphlib.TopologicalSorter(graph).static_order()
+            )
+        except graphlib.CycleError as error:
+            cycle = list(dict.fromkeys(error.args[1]))
+            target = cycle[0]
+
+            for unit in cycle[1:]:
+                for name in members[unit]:
+                    owner[name] = target
+
+                members[target].extend(members.pop(unit))
+
+            continue
+
+        return [sorted(members[unit]) for unit in ordered]
+
+
+def pack_schema_groups(ordered_units, lockable_counts, budget):
+    groups = []
+    current = []
+    current_size = 0
+
+    for unit in ordered_units:
+        unit_size = sum(
+            lockable_counts.get(name, 0) for name in unit
+        )
+
+        if current and current_size + unit_size > budget:
+            groups.append((current, current_size))
+            current, current_size = [], 0
+
+        current = current + unit
+        current_size += unit_size
+
+        if current_size > budget:
+            groups.append((current, current_size))
+            current, current_size = [], 0
+
+    if current:
+        groups.append((current, current_size))
+
+    return groups
+
+
+def chunked_export(
+    configuration,
+    password_file,
+    output_directory,
+    database,
+    inspection,
+    base_arguments,
+    file_stem,
+):
+    print()
+    print(
+        "Falling back to a chunked export: first a file with "
+        "everything except relations, then dependency-ordered "
+        "groups of schemas that each fit in the server's lock "
+        "table. Restore the resulting files in file name order.",
+        flush=True,
+    )
+
+    try:
+        connection, _ = connect_to_database(
+            configuration,
+            database["name"],
+            password_file,
+        )
+
+        try:
+            relation_rows, edge_rows = collect_chunk_metadata(
+                connection,
+                configuration["role"],
+            )
+
+            connection.rollback()
+        finally:
+            connection.close()
+
+    except psycopg.Error as error:
+        print(
+            f"Could not analyze schemas for chunking: {error}",
+            file=sys.stderr,
+        )
+
+        return {
+            "succeeded": False,
+            "error": str(error),
+            "parts": [],
+        }
+
+    excluded_oids = inspection["excluded_relation_oids"]
+
+    excluded_sequence_oids = {
+        oid for _, _, oid in inspection["excluded_sequences"]
+    }
+
+    survivor_counts = defaultdict(int)
+    lockable_counts = defaultdict(int)
+
+    for schema_name, oid, relkind in relation_rows:
+        if schema_name in inspection["excluded_schemas"]:
+            continue
+
+        if oid in excluded_oids or oid in excluded_sequence_oids:
+            continue
+
+        survivor_counts[schema_name] += 1
+
+        if relkind in ("r", "p"):
+            lockable_counts[schema_name] += 1
+
+    edges = [
+        (dependent, required)
+        for dependent, required in edge_rows
+        if dependent in survivor_counts and required in survivor_counts
+    ]
+
+    budget = max(64, lock_capacity(inspection) // 2)
+
+    groups = pack_schema_groups(
+        order_schema_units(sorted(survivor_counts), edges),
+        lockable_counts,
+        budget,
+    )
+
+    exclusions = exclusion_filter_entries(inspection)
+    parts = []
+    succeeded = True
+
+    def run_part(part_name, filter_entries, include_create):
+        filter_path = (
+            output_directory
+            / "filters"
+            / f"{file_stem}__{part_name}.filter"
+        )
+
+        write_filter_file(filter_path, filter_entries)
+
+        arguments = [*base_arguments, f"--filter={filter_path}"]
+
+        if include_create:
+            arguments.append("--create")
+
+        return run_tool_to_file(
+            configuration["pg_dump_path"],
+            arguments,
+            output_directory
+            / "databases"
+            / f"{file_stem}__{part_name}.sql",
+        )
+
+    prelude_entries = [
+        f"exclude extension {quote_filter_identifier(name)}"
+        for name in sorted(inspection["excluded_extensions"])
+    ] + [
+        f"exclude schema {quote_filter_identifier(name)}"
+        for name in sorted(inspection["excluded_schemas"])
+    ] + [
+        "exclude table *.*",
+    ]
+
+    result = run_part(
+        "part-000-prelude",
+        prelude_entries,
+        configuration["include_create_database"],
+    )
+
+    succeeded = result["succeeded"]
+
+    parts.append({
+        "part": "part-000-prelude",
+        "schemas": None,
+        "table_count": 0,
+        "succeeded": result["succeeded"],
+        "return_code": result["return_code"],
+        "output": result["output"],
+        "messages": None if result["succeeded"] else result["messages"],
+    })
+
+    for index, (schemas, table_count) in enumerate(groups, start=1):
+        part_name = f"part-{index:03d}"
+
+        if table_count > budget:
+            print(
+                f"Warning: {part_name} needs {table_count} table "
+                f"locks, more than the {budget}-lock budget, "
+                "because a single schema or dependency cycle "
+                "cannot be split further. Attempting it anyway...",
+                flush=True,
+            )
+
+        includes = [
+            f"include table {quote_filter_identifier(name)}.*"
+            for name in schemas
+        ]
+
+        result = run_part(
+            part_name,
+            [*includes, *exclusions],
+            False,
+        )
+
+        succeeded = succeeded and result["succeeded"]
+
+        parts.append({
+            "part": part_name,
+            "schemas": schemas,
+            "table_count": table_count,
+            "succeeded": result["succeeded"],
+            "return_code": result["return_code"],
+            "output": result["output"],
+            "messages": (
+                None if result["succeeded"] else result["messages"]
+            ),
+        })
+
+    return {
+        "succeeded": succeeded,
+        "lock_budget": budget,
+        "parts": parts,
+    }
+
+
 def database_file_stem(database):
     return (
         f"{safe_filename(database['name'])}"
@@ -1233,6 +1655,12 @@ def inspection_report(inspection):
                     relations,
                 ),
             )
+        ],
+        "excluded_sequences": [
+            {"schema": schema_name, "name": sequence_name}
+            for schema_name, sequence_name, _ in inspection[
+                "excluded_sequences"
+            ]
         ],
         "permission_failures": inspection[
             "inaccessible_relations"
@@ -1312,7 +1740,7 @@ def export_database(
         / f"{file_stem}.sql"
     )
 
-    arguments = [
+    base_arguments = [
         f"--dbname={conninfo}",
         "--no-password",
         "--format=plain",
@@ -1320,24 +1748,26 @@ def export_database(
     ]
 
     if configuration["lock_timeout"]:
-        arguments.append(
+        base_arguments.append(
             f"--lock-wait-timeout={configuration['lock_timeout'] * 1000}"
         )
+
+    if configuration["role"]:
+        base_arguments.append(f"--role={configuration['role']}")
+
+    if not configuration["keep_ownership"]:
+        base_arguments.extend([
+            "--no-owner",
+            "--no-privileges",
+        ])
+
+    arguments = list(base_arguments)
 
     if filter_entries:
         arguments.append(f"--filter={filter_path}")
 
-    if configuration["role"]:
-        arguments.append(f"--role={configuration['role']}")
-
     if configuration["include_create_database"]:
         arguments.append("--create")
-
-    if not configuration["keep_ownership"]:
-        arguments.extend([
-            "--no-owner",
-            "--no-privileges",
-        ])
 
     if inspection["included_table_count"] > lock_capacity(inspection):
         print()
@@ -1366,12 +1796,25 @@ def export_database(
     )
 
     failure_hint = None
+    chunk_report = None
 
     if lock_exhaustion:
         failure_hint = lock_exhaustion_advice(inspection)
         print()
         print(failure_hint, flush=True)
-        print()
+
+        chunk_report = chunked_export(
+            configuration,
+            password_file,
+            output_directory,
+            database,
+            inspection,
+            base_arguments,
+            file_stem,
+        )
+
+        if chunk_report["succeeded"]:
+            status = "completed_chunked"
 
     print(f"Database status: {status}")
 
@@ -1383,6 +1826,7 @@ def export_database(
         "pg_dump_return_code": result["return_code"],
         "pg_dump_messages": result["messages"],
         "failure_hint": failure_hint,
+        "chunked": chunk_report,
         "inspection": inspection_report(inspection),
     }
 
@@ -1545,7 +1989,10 @@ def main():
         completed = sum(
             1
             for database in report["databases"]
-            if database["status"] == "completed"
+            if database["status"] in {
+                "completed",
+                "completed_chunked",
+            }
         )
 
         skipped = sum(
