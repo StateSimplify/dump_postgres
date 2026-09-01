@@ -61,6 +61,14 @@ failed, and `2` on a fatal error.
 Two prompts keep the export from hanging indefinitely:
 
 - **Connection timeout** (default 30 s) bounds every connection attempt.
+  While connecting, the script retries in 15-second slices and prints a
+  progress line each time, so a server that is not answering is visible
+  immediately rather than after the full timeout. A server that is up
+  and reachable answers in a second or two — if you see "still trying"
+  lines at all, the problem is connectivity (wrong host or port, VPN not
+  connected, firewall or cloud security group), and a larger timeout
+  will not fix it. The failure message includes the addresses the host
+  name resolves to and flags private addresses that need a VPN.
 - **Table lock wait timeout** (default 120 s) is passed to `pg_dump` as
   `--lock-wait-timeout`, so a table locked by another session makes that
   database fail with a clear error instead of blocking forever. Set

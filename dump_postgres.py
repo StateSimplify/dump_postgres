@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 
 import getpass
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -34,6 +37,10 @@ SSL_MODES = {
     "verify-ca",
     "verify-full",
 }
+
+# While connecting, retry in short slices so progress can be printed
+# instead of sitting silently for the whole connection timeout.
+CONNECT_ATTEMPT_SECONDS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +458,69 @@ def make_database_conninfo(configuration, database, password_file):
     return make_conninfo(**parameters)
 
 
+def resolved_addresses(host):
+    if not host or host.startswith("/"):
+        return []
+
+    try:
+        results = socket.getaddrinfo(host, None)
+    except OSError:
+        return []
+
+    addresses = []
+
+    for result in results:
+        address = result[4][0]
+
+        if address not in addresses:
+            addresses.append(address)
+
+    return addresses
+
+
+def is_private_address(address):
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+
+    return parsed.is_private and not parsed.is_loopback
+
+
+def connection_timeout_error(configuration, database, waited_seconds):
+    host = configuration["host"]
+
+    lines = [
+        f"connection to {host} port {configuration['port']} "
+        f"(database \"{database}\", user "
+        f"\"{configuration['username']}\") timed out after "
+        f"{waited_seconds} seconds.",
+        "Nothing answered on that host and port, which usually "
+        "means the traffic is being dropped before it reaches "
+        "PostgreSQL. Check that the host and port are correct, "
+        "that PostgreSQL is running and listening on that "
+        "address, and that a firewall, VPN, or cloud security "
+        "group is not blocking the connection.",
+    ]
+
+    addresses = resolved_addresses(host)
+
+    if addresses:
+        lines.append(
+            "The host resolves to: " + ", ".join(addresses) + "."
+        )
+
+    if any(is_private_address(address) for address in addresses):
+        lines.append(
+            "That is a private network address, so the server "
+            "can only be reached from inside its network (a VPN, "
+            "a bastion or jump host, or a machine in the same "
+            "VPC or LAN)."
+        )
+
+    return psycopg.OperationalError("\n".join(lines))
+
+
 def connect_to_database(configuration, database, password_file):
     conninfo = make_database_conninfo(
         configuration,
@@ -458,31 +528,61 @@ def connect_to_database(configuration, database, password_file):
         password_file,
     )
 
-    try:
-        with without_pg_environment():
-            connection = psycopg.connect(conninfo)
+    total_timeout = configuration["connect_timeout"]
 
-    except psycopg.OperationalError as error:
-        if "timeout" in str(error).lower():
-            raise psycopg.OperationalError(
-                f"connection to {configuration['host']} port "
-                f"{configuration['port']} (database "
-                f"\"{database}\", user "
-                f"\"{configuration['username']}\") timed out "
-                f"after {configuration['connect_timeout']} "
-                "seconds.\n"
-                "Nothing answered on that host and port, which "
-                "usually means the traffic is being dropped "
-                "before it reaches PostgreSQL. Check that the "
-                "host and port are correct, that PostgreSQL is "
-                "running and listening on that address, and that "
-                "a firewall, VPN, or cloud security group is not "
-                "blocking the connection."
-            ) from error
+    deadline = (
+        time.monotonic() + total_timeout
+        if total_timeout
+        else None
+    )
 
-        raise
+    waited = 0
 
-    return connection, conninfo
+    while True:
+        if deadline is None:
+            attempt_timeout = CONNECT_ATTEMPT_SECONDS
+        else:
+            remaining = deadline - time.monotonic()
+            attempt_timeout = min(
+                CONNECT_ATTEMPT_SECONDS,
+                max(2, int(remaining + 0.999)),
+            )
+
+        attempt_conninfo = make_conninfo(
+            conninfo,
+            connect_timeout=attempt_timeout,
+        )
+
+        try:
+            with without_pg_environment():
+                connection = psycopg.connect(attempt_conninfo)
+
+            return connection, conninfo
+
+        except psycopg.OperationalError as error:
+            # Anything other than a timeout (connection refused,
+            # unknown host, failed authentication, ...) is final.
+            if "timeout" not in str(error).lower():
+                raise
+
+            waited += attempt_timeout
+
+            if (
+                deadline is not None
+                and time.monotonic() >= deadline
+            ):
+                raise connection_timeout_error(
+                    configuration,
+                    database,
+                    total_timeout,
+                ) from error
+
+            print(
+                f"  Still trying to reach {configuration['host']} "
+                f"port {configuration['port']} "
+                f"({waited}s elapsed, Ctrl-C to give up)...",
+                flush=True,
+            )
 
 
 def validate_role(connection, role):
@@ -1196,10 +1296,17 @@ def main():
             configuration["password"]
         )
 
+        addresses = resolved_addresses(configuration["host"])
+
+        address_note = (
+            f" ({', '.join(addresses)})" if addresses else ""
+        )
+
         print()
         print(
             f"Connecting to {configuration['host']} port "
-            f"{configuration['port']} and discovering databases...",
+            f"{configuration['port']}{address_note} "
+            "and discovering databases...",
             flush=True,
         )
 
